@@ -94,6 +94,20 @@ todo-baton --newline-key ctrl+j        # BATON_NEWLINE_KEY=ctrl+j でも同じ
 | `BATON_TARGET` | 送信先のターミナルを固定する |
 | `BATON_NEWLINE_KEY` | 複数行の改行キー (`alt+enter` / `ctrl+j`) |
 
+## 設定ファイル
+
+`~/.config/baton/env` (`XDG_CONFIG_HOME` を尊重) に `KEY=value` を書くと、上の環境変数の既定値になる。シェルの rc を触らずに済む。
+
+```sh
+# ~/.config/baton/env
+BATON_DIR=~/src/todo
+BATON_NEWLINE_KEY=ctrl+j
+```
+
+`#` で始まる行は註釈。値の引用符は剥がす。`BATON_` で始まらないキーは読まない。**環境変数が設定されていればそちらが勝つ**ので、その場だけ変えたいときは `BATON_DIR=... todo-baton` でよい。
+
+外部ライブラリは使わない (stdlib のみ)。プロジェクト内に `.env` を置く方式は、プロジェクトを汚さない方針に反するので採らない。
+
 ## インストール
 
 `~/.local/bin/todo-baton` に配置してください。

@@ -1039,6 +1039,35 @@ class Picker:
 # ---------------------------------------------------------------- entry
 
 
+def config_path() -> Path:
+    """設定ファイルの場所。XDG_CONFIG_HOME を尊重する。"""
+    root = os.environ.get("XDG_CONFIG_HOME")
+    base = Path(root).expanduser() if root else Path.home() / ".config"
+    return base / "baton" / "env"
+
+
+def load_config() -> None:
+    """設定ファイルの KEY=value を BATON_* の既定値として読む。環境変数が優先。"""
+    try:
+        text = config_path().read_text(encoding="utf-8")
+    except OSError:
+        return
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, sep, value = line.partition("=")
+        if not sep:
+            continue
+        key = key.strip()
+        if not key.startswith("BATON_") or key in os.environ:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        os.environ[key] = value
+
+
 def resolve_todo(path_arg: str | None, backend: Backend | None) -> Path:
     if path_arg:
         return Path(path_arg).expanduser()
@@ -1065,6 +1094,7 @@ def do_open(backend: Backend, todo_path: Path, direction: str, focus: bool) -> i
 
 def main() -> int:
     locale.setlocale(locale.LC_ALL, "")
+    load_config()
     parser = argparse.ArgumentParser(
         prog="todo-baton",
         description="todo.md の項目を選んで隣のターミナルの入力欄へ渡す",
