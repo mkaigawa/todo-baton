@@ -21,7 +21,16 @@ todo-baton --list      # 項目を一覧表示するだけ
 
 `[]` `[ ]` `[x]` のいずれでもよく、`x` のときだけ完了。チェックボックス行の直後から **空行 / 見出し / 次のチェックボックス行** のどれかが現れるまでが同じ項目になる。継続行のインデントは任意。
 
-探索は cwd から親方向に `todo.md` `TODO.md` `Todo.md` `.baton/todo.md` を探し、ホームディレクトリで打ち切る。
+置き場所は次の順に決まる。
+
+1. `--file` / `BATON_FILE`
+2. cwd から親方向に `<ディレクトリ名>_todo.md` (既定は対象ディレクトリの親、`BATON_DIR` で置き場所を変えられる)
+3. cwd から親方向に `todo.md` `TODO.md` `Todo.md` `.baton/todo.md`
+4. `~/todo.md`
+
+いずれも無いときは 2 の位置に作る。**プロジェクト内に todo.md を作らない**のが狙いで、`~/src/mkaigawa/chat/` で起動すると `~/src/mkaigawa/chat_todo.md` を使う。`BATON_DIR=~/todos` にすれば `~/todos/chat_todo.md` になり、プロジェクトごとに別ファイルのまま一箇所へ集められる。
+
+既に 3 の場所に `todo.md` があればそれを使い続けるので、従来の置き方は壊れない。
 
 ## キー操作
 
@@ -79,7 +88,8 @@ todo-baton --newline-key ctrl+j        # BATON_NEWLINE_KEY=ctrl+j でも同じ
 
 | 変数 | 意味 |
 |---|---|
-| `BATON_FILE` | todo.md のパス |
+| `BATON_FILE` | todo.md のパス (1 ファイル固定) |
+| `BATON_DIR` | `<ディレクトリ名>_todo.md` の置き場所 (既定: 対象ディレクトリの親) |
 | `BATON_BACKEND` | `cmux` / `tmux` |
 | `BATON_TARGET` | 送信先のターミナルを固定する |
 | `BATON_NEWLINE_KEY` | 複数行の改行キー (`alt+enter` / `ctrl+j`) |

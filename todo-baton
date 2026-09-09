@@ -592,8 +592,24 @@ def base_dirs(backend: Backend | None) -> list[Path]:
     return dirs
 
 
+def sibling_path(directory: Path) -> Path | None:
+    """directory 用の <ディレクトリ名>_todo.md。既定は親、BATON_DIR で変えられる。"""
+    if directory == Path.home() or directory == directory.parent:
+        return None
+    env_dir = os.environ.get("BATON_DIR")
+    holder = Path(env_dir).expanduser() if env_dir else directory.parent
+    return holder / f"{directory.name}_todo.md"
+
+
 def find_todo(bases: list[Path]) -> Path:
-    """各起点から親方向に todo.md を探す。ホームディレクトリで打ち切る。"""
+    """todo.md を探す。プロジェクトの外に置いた <名前>_todo.md を優先する。"""
+    for base in bases:
+        for directory in [base, *base.parents]:
+            candidate = sibling_path(directory)
+            if candidate is not None and candidate.is_file():
+                return candidate
+            if directory == Path.home():
+                break
     for base in bases:
         for directory in [base, *base.parents]:
             for name in TODO_NAMES:
@@ -605,7 +621,8 @@ def find_todo(bases: list[Path]) -> Path:
     fallback = Path.home() / "todo.md"
     if fallback.is_file():
         return fallback
-    return bases[0] / "todo.md"
+    # 新規作成でプロジェクト内を汚さないため、外に置く
+    return sibling_path(bases[0]) or fallback
 
 
 # ---------------------------------------------------------------- 項目の整形
