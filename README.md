@@ -46,20 +46,6 @@ todo-baton --list      # 項目を一覧表示するだけ
 | r | 再読込 |
 | q | 終了 |
 
-## 送信先の入力欄が空になるとき
-
-送信先が Claude Code で、入力欄が **vim モード**のときに起きる。
-
-複数行の項目は行の区切りに Alt+Enter を送るが、これが ESC + Enter にばらけて届くと、受け取った Claude Code は ESC を Escape キーとして解釈して NORMAL モードに落ちる。そこから先に送った文字はコマンドとして食われるので、入力欄には何も入らない。一度こうなると次からは 1 行の項目でも入らない (入力欄をクリックして `i` を押せば戻る)。
-
-改行キーを ESC を使わないものに替えると避けられる。
-
-```bash
-todo-baton --newline-key ctrl+j        # BATON_NEWLINE_KEY=ctrl+j でも同じ
-```
-
-`ctrl+j` は Claude Code の入力欄では改行になるが、シェルでは行の実行になる。送信先がシェルのペインなら既定の `alt+enter` のままにすること。
-
 ## バックエンド
 
 どのターミナルへ渡すかはバックエンドが決める。起動時に環境から選び、`--backend` か `BATON_BACKEND` で固定できる。
@@ -69,20 +55,7 @@ todo-baton --newline-key ctrl+j        # BATON_NEWLINE_KEY=ctrl+j でも同じ
 | `cmux` | 同じワークスペースで選択中のターミナル | `CMUX_SURFACE_ID` があれば |
 | `tmux` | 同じウィンドウのアクティブなペイン | `TMUX` があれば |
 
-ピッカー本体はバックエンドの 6 つのメソッド (`refresh` / `send_text` / `submit` / `focus` / `base_dir` / `open_pane`) しか知らない。多重化ソフトごとの癖はそれぞれのクラスに閉じている。
-
-### cmux の癖
-
-- `cmux send -- <text>` は本文中の `\n` `\r` `\t` を改行・改行・Tab に変換するので、含んだまま送ると途中で送信される。バックスラッシュの直後で切って複数回に分けて送る (`CmuxBackend._split_escapes`)
-- 改行を入れるには `cmux send-key --surface <id> alt+enter` を挟む。Claude Code は Option+Enter を改行として扱う (ESC + Enter にばらけると Escape として届く。「送信先の入力欄が空になるとき」を参照)
-- ブラケットペースト注入 (`ESC[200~` … `ESC[201~`) は使えない。zsh には効くが Claude Code は ESC を Escape キーとして受け取る
-- 分割ペインにコマンドを直接渡せないので、シェルが立ち上がるのを待って打ち込み、ピッカーが出るまで打ち直す
-
-### tmux の癖
-
-- `send-keys -l --` はバックスラッシュを解釈しないので、cmux のような分割送りは要らない
-- 改行は `send-keys M-Enter`。ESC + CR という通常の Alt 表現で届く
-- `split-window` にコマンドを直接渡せるので、打ち直しの再試行は要らない
+送信先が Claude Code で入力欄が vim モードのときは入力欄に何も入らないことがある。入力欄をクリックして `i` を押すか、`BATON_NEWLINE_KEY=ctrl+j` を試してください。
 
 ## 環境変数
 
@@ -100,7 +73,7 @@ todo-baton --newline-key ctrl+j        # BATON_NEWLINE_KEY=ctrl+j でも同じ
 
 ```sh
 # ~/.config/baton/env
-BATON_DIR=~/src/todo
+BATON_DIR=~/todos
 BATON_NEWLINE_KEY=ctrl+j
 ```
 
@@ -110,14 +83,24 @@ BATON_NEWLINE_KEY=ctrl+j
 
 ## インストール
 
-`~/.local/bin/todo-baton` に配置してください。
-
 ```bash
+git clone git@github.com:mkaigawa/todo-baton.git
+cd todo-baton
 chmod +x todo-baton
 mv todo-baton ~/.local/bin/
+```
+
+`~/.local/bin` が `PATH` に無ければ、シェルの rc ファイルに追加してください。
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
 ## 要件
 
 - Python 3.7+
 - cmux または tmux
+
+## ライセンス
+
+MIT License. 詳細は [LICENSE](LICENSE) を参照してください。
