@@ -56,7 +56,7 @@ todo-baton --list      # 項目を一覧表示するだけ
 
 バックエンドが持つ責務は **送信先を決める `resolve_target()` と入力欄へ置く `paste()` の 2 つだけ**で、ピッカー本体はこの 2 つしか呼ばない。`focus()` `base_dir()` `open_pane()` はできるものだけが実装する任意の口。zellij や wezterm を足すときは `Backend` を継承して外部コマンドを薄く包み、`BACKENDS` に加える。
 
-送信先が Claude Code で入力欄が vim モードのときは入力欄に何も入らないことがある。入力欄をクリックして `i` を押すか、`BATON_NEWLINE_KEY=ctrl+j` を試してください。
+送信先が Claude Code で入力欄が vim モードのときは入力欄に何も入らないことがある。入力欄をクリックして `i` を押すか、`todo-baton --newline-key ctrl+j` を試してください。
 
 ## 環境変数
 
@@ -64,9 +64,6 @@ todo-baton --list      # 項目を一覧表示するだけ
 |---|---|
 | `BATON_FILE` | todo.md のパス (1 ファイル固定) |
 | `BATON_DIR` | `<ディレクトリ名>_todo.md` の置き場所 (既定: 対象ディレクトリの親) |
-| `BATON_BACKEND` | `cmux` / `tmux` |
-| `BATON_TARGET` | 送信先のターミナルを固定する |
-| `BATON_NEWLINE_KEY` | 複数行の改行キー (`alt+enter` / `ctrl+j`) |
 
 ## 設定ファイル
 
@@ -75,7 +72,6 @@ todo-baton --list      # 項目を一覧表示するだけ
 ```sh
 # ~/.config/baton/env
 BATON_DIR=~/todos
-BATON_NEWLINE_KEY=ctrl+j
 ```
 
 `#` で始まる行は註釈。値の引用符は剥がす。`BATON_` で始まらないキーは読まない。**環境変数が設定されていればそちらが勝つ**ので、その場だけ変えたいときは `BATON_DIR=... todo-baton` でよい。
