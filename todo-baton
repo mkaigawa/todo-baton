@@ -10,7 +10,8 @@ todo.md をテキストエディタで書き足すと自動で読み直し、選
     todo-baton --list      項目を一覧表示するだけ
 
 どのターミナルへ渡すかはバックエンドが決める。今あるのは cmux と tmux で、
-起動時に環境から選ぶ (BATON_BACKEND / --backend で固定できる)。
+起動時に環境から選ぶ (BATON_BACKEND / --backend で固定できる)。バックエンドは
+resolve_target() と paste() の 2 つだけを外に見せる。
 
 cmux の Dock (右サイドバー) が使えるビルドでは ~/.config/cmux/dock.json の
 TODO コントロールから同じピッカーが立ち上がる。
@@ -77,8 +78,13 @@ class Target:
 class Backend:
     """項目を別のターミナルの入力欄まで運ぶ経路。
 
-    ピッカー本体はこのインターフェースだけを知る。ターミナル多重化ソフトごとの
-    癖 (エスケープの解釈、改行の入れかた、ペインの作りかた) はここに閉じ込める。
+    ピッカー本体が知るのは resolve_target() と paste() だけで、送信先の ID も
+    外部コマンドの形も見ない。ターミナル多重化ソフトごとの癖 (エスケープの
+    解釈、改行の入れかた、ペインの作りかた) はここに閉じ込める。
+
+    zellij や wezterm を足すときも、この 2 つと、できるなら任意の 3 つ
+    (focus / base_dir / open_pane) を外部コマンドの薄いラッパーとして書き、
+    BACKENDS に加えるだけで済む。呼ぶ側には分岐を持たせない。
     """
 
     name = ""
@@ -90,6 +96,9 @@ class Backend:
     NEWLINE_KEYS: dict[str, str] = {}
     newline_key = "alt+enter"
 
+    def __init__(self) -> None:
+        self.target = Target()
+
     @classmethod
     def detect(cls, inside_only: bool = True) -> "Backend | None":
         """この環境で使えるなら実体を返す。
@@ -98,14 +107,30 @@ class Backend:
         """
         return None
 
-    def refresh(self, target: Target) -> None:
-        """送信先を今アクティブなターミナルに追従させる。固定なら何もしない。"""
+    def pin(self, target_id: str) -> None:
+        """送信先を固定する。以降 resolve_target() は追従しない。"""
+        self.target = Target(id=target_id, pinned=True)
 
-    def send_text(self, target: Target, lines: list[str]) -> str:
-        """入力欄にテキストを置く。送信キーは押さない。エラー文字列を返す。"""
+    # -- 必須の 2 つ
+
+    def resolve_target(self) -> Target | None:
+        """送信先を今アクティブなターミナルに決め直して返す。
+
+        固定されているときはそのまま返す。渡せる相手が居なければ None。
+        """
         raise NotImplementedError
 
-    def focus(self, target: Target) -> None:
+    def paste(self, text: str) -> str:
+        """送信先の入力欄に text を置く。送信キーは押さない。
+
+        text の改行はそのまま流すと Enter として届いて途中で送信されるので、
+        行の区切りには改行キーを送る。エラー文字列を返す。
+        """
+        raise NotImplementedError
+
+    # -- 任意。できないバックエンドは実装しなくてよい
+
+    def focus(self) -> None:
         """送信先のターミナルへフォーカスを移す。"""
 
     def base_dir(self) -> Path | None:
@@ -132,6 +157,7 @@ class CmuxBackend(Backend):
     NEWLINE_KEYS = {"alt+enter": "alt+enter", "ctrl+j": "ctrl+j"}
 
     def __init__(self, cli: str) -> None:
+        super().__init__()
         self.cli = cli
         self.self_surface = os.environ.get("CMUX_SURFACE_ID") or ""
         self.self_workspace = os.environ.get("CMUX_WORKSPACE_ID") or ""
@@ -162,9 +188,12 @@ class CmuxBackend(Backend):
 
     # -- 送信先
 
-    def refresh(self, target: Target) -> None:
-        if target.pinned:
-            return
+    def resolve_target(self) -> Target | None:
+        if not self.target.pinned:
+            self._follow_active()
+        return self.target if self.target.id else None
+
+    def _follow_active(self) -> None:
         tree = self.cmux_json("tree", "--json", "--id-format", "both")
         if not tree:
             return
@@ -174,15 +203,16 @@ class CmuxBackend(Backend):
         active = (tree.get("active") or {}).get("surface_id")
         for surface in candidates:
             if surface["id"] == active:
-                target.id, target.title = surface["id"], surface.get("title") or ""
+                self.target.id = surface["id"]
+                self.target.title = surface.get("title") or ""
                 return
-        if any(surface["id"] == target.id for surface in candidates):
+        if any(surface["id"] == self.target.id for surface in candidates):
             for surface in candidates:
-                if surface["id"] == target.id:
-                    target.title = surface.get("title") or target.title
+                if surface["id"] == self.target.id:
+                    self.target.title = surface.get("title") or self.target.title
             return
-        target.id = candidates[0]["id"]
-        target.title = candidates[0].get("title") or ""
+        self.target.id = candidates[0]["id"]
+        self.target.title = candidates[0].get("title") or ""
 
     def _candidates(self, tree: dict) -> list[dict]:
         found: list[dict] = []
@@ -206,20 +236,18 @@ class CmuxBackend(Backend):
 
     # -- 送る
 
-    def send_text(self, target: Target, lines: list[str]) -> str:
-        """改行はそのまま送ると Enter として届いて途中で送信されてしまうので、
-        行の区切りには改行キー (既定は Option+Enter) を送る。
-        """
+    def paste(self, text: str) -> str:
         key = self.NEWLINE_KEYS[self.newline_key]
-        for index, line in enumerate(lines):
+        for index, line in enumerate(text.split("\n")):
             if index:
-                code, _, err = self.cmux("send-key", "--surface", target.id, key)
+                code, _, err = self.cmux("send-key", "--surface", self.target.id, key)
                 if code != 0:
                     return err.strip() or "改行を送れませんでした"
             for chunk in self._split_escapes(line):
                 if not chunk:
                     continue
-                code, _, err = self.cmux("send", "--surface", target.id, "--", chunk)
+                code, _, err = self.cmux(
+                    "send", "--surface", self.target.id, "--", chunk)
                 if code != 0:
                     return err.strip() or "テキストを送れませんでした"
         return ""
@@ -242,8 +270,11 @@ class CmuxBackend(Backend):
             chunks.append("".join(buffer))
         return chunks
 
-    def focus(self, target: Target) -> None:
-        self.cmux("rpc", "surface.focus", json.dumps({"surface_id": target.id}))
+    def focus(self) -> None:
+        self._focus_surface(self.target.id)
+
+    def _focus_surface(self, surface_id: str) -> None:
+        self.cmux("rpc", "surface.focus", json.dumps({"surface_id": surface_id}))
 
     def base_dir(self) -> Path | None:
         """cmux が把握しているワークスペースの現在ディレクトリ。
@@ -289,7 +320,7 @@ class CmuxBackend(Backend):
                 # タブ名が exec の長いコマンドラインになるので付け替える
                 self.cmux("rename-tab", "--surface", surface_id, "--", "TODO")
                 if focus:
-                    self.focus(Target(id=surface_id))
+                    self._focus_surface(surface_id)
                 return surface_id, ""
 
         return surface_id, "ペインは作れましたが、ピッカーが起動しませんでした"
@@ -335,6 +366,7 @@ class TmuxBackend(Backend):
     NEWLINE_KEYS = {"alt+enter": "M-Enter", "ctrl+j": "C-j"}
 
     def __init__(self) -> None:
+        super().__init__()
         self.self_pane = os.environ.get("TMUX_PANE") or ""
 
     @classmethod
@@ -350,9 +382,12 @@ class TmuxBackend(Backend):
 
     # -- 送信先
 
-    def refresh(self, target: Target) -> None:
-        if target.pinned:
-            return
+    def resolve_target(self) -> Target | None:
+        if not self.target.pinned:
+            self._follow_active()
+        return self.target if self.target.id else None
+
+    def _follow_active(self) -> None:
         code, out, _ = self.tmux(
             "list-panes", "-F", "#{pane_id}\t#{pane_active}\t#{pane_last}\t#{pane_title}")
         if code != 0:
@@ -371,31 +406,32 @@ class TmuxBackend(Backend):
         # アクティブなペイン → 直前に居たペイン → 先頭 の順に選ぶ
         candidates.sort(key=lambda c: (not c[1], not c[2]))
         pane_id, _, _, title = candidates[0]
-        if any(c[0] == target.id for c in candidates) and not candidates[0][1]:
+        if any(c[0] == self.target.id for c in candidates) and not candidates[0][1]:
             for candidate in candidates:
-                if candidate[0] == target.id:
-                    target.title = candidate[3] or target.title
+                if candidate[0] == self.target.id:
+                    self.target.title = candidate[3] or self.target.title
                     return
-        target.id, target.title = pane_id, title
+        self.target.id, self.target.title = pane_id, title
 
     # -- 送る
 
-    def send_text(self, target: Target, lines: list[str]) -> str:
+    def paste(self, text: str) -> str:
         key = self.NEWLINE_KEYS[self.newline_key]
-        for index, line in enumerate(lines):
+        for index, line in enumerate(text.split("\n")):
             if index:
-                code, _, err = self.tmux("send-keys", "-t", target.id, key)
+                code, _, err = self.tmux("send-keys", "-t", self.target.id, key)
                 if code != 0:
                     return err.strip() or "改行を送れませんでした"
             if not line:
                 continue
-            code, _, err = self.tmux("send-keys", "-t", target.id, "-l", "--", line)
+            code, _, err = self.tmux(
+                "send-keys", "-t", self.target.id, "-l", "--", line)
             if code != 0:
                 return err.strip() or "テキストを送れませんでした"
         return ""
 
-    def focus(self, target: Target) -> None:
-        self.tmux("select-pane", "-t", target.id)
+    def focus(self) -> None:
+        self.tmux("select-pane", "-t", self.target.id)
 
     def base_dir(self) -> Path | None:
         code, out, _ = self.tmux(
@@ -705,11 +741,11 @@ HELP_LINES = [
 
 
 class Picker:
-    def __init__(self, todo: TodoFile, backend: Backend, target: Target,
+    def __init__(self, todo: TodoFile, backend: Backend,
                  focus_after_send: bool):
         self.todo = todo
         self.backend = backend
-        self.target = target
+        self.target: Target | None = None  # 表示用。実体は backend が持つ
         self.focus_after_send = focus_after_send
         self.cursor = 0
         self.scroll = 0
@@ -766,7 +802,7 @@ class Picker:
             self._draw_body(stdscr, items, body_top, body_bottom, body_height, usable)
 
         self._put(stdscr, body_bottom, 0, "─" * usable, self._color(4))
-        if self.target.id:
+        if self.target is not None:
             label = self.target.label
             suffix = " (固定)" if self.target.pinned else ""
             line = f" → {label}{suffix}"
@@ -875,20 +911,20 @@ class Picker:
         if item is None:
             self.say("送る項目がありません")
             return
-        self.backend.refresh(self.target)
-        if not self.target.id:
+        self.target = self.backend.resolve_target()
+        if self.target is None:
             self.say("送信先のターミナルが見つかりません")
             return
         lines = payload_lines(item)
         if not any(lines):
             self.say("本文が空なので送れません")
             return
-        error = self.backend.send_text(self.target, lines)
+        error = self.backend.paste("\n".join(lines))
         if error:
             self.say(error, 6.0)
             return
         if self.focus_after_send:
-            self.backend.focus(self.target)
+            self.backend.focus()
         label = dtrunc(lines[0], 40)
         if len(lines) > 1:
             label += f" (全 {len(lines)} 行)"
@@ -962,12 +998,12 @@ class Picker:
             except curses.error:
                 pass
 
-        self.backend.refresh(self.target)
+        self.target = self.backend.resolve_target()
         while True:
             now = time.monotonic()
             if now - self.last_poll >= POLL_INTERVAL:
                 self.last_poll = now
-                self.backend.refresh(self.target)
+                self.target = self.backend.resolve_target()
                 if self.todo.changed_on_disk():
                     self.todo.load()
             self.draw(stdscr)
@@ -999,7 +1035,7 @@ class Picker:
                 self.act_toggle()
             elif key in ("r", "R"):
                 self.todo.load()
-                self.backend.refresh(self.target)
+                self.target = self.backend.resolve_target()
                 self.say("読み直しました")
             elif key in ("f", "F"):
                 self.hide_done = not self.hide_done
@@ -1127,8 +1163,9 @@ def main() -> int:
         return do_open(backend, path, args.direction, args.focus)
 
     pinned = args.target or os.environ.get("BATON_TARGET") or ""
-    target = Target(id=pinned, pinned=bool(pinned))
-    picker = Picker(todo, backend, target, focus_after_send=not args.no_focus)
+    if pinned:
+        backend.pin(pinned)
+    picker = Picker(todo, backend, focus_after_send=not args.no_focus)
     curses.wrapper(picker.run)
     return 0
 

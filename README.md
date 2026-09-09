@@ -54,6 +54,8 @@ todo-baton --list      # 項目を一覧表示するだけ
 | `cmux` | 同じワークスペースで選択中のターミナル | `CMUX_SURFACE_ID` があれば |
 | `tmux` | 同じウィンドウのアクティブなペイン | `TMUX` があれば |
 
+バックエンドが持つ責務は **送信先を決める `resolve_target()` と入力欄へ置く `paste()` の 2 つだけ**で、ピッカー本体はこの 2 つしか呼ばない。`focus()` `base_dir()` `open_pane()` はできるものだけが実装する任意の口。zellij や wezterm を足すときは `Backend` を継承して外部コマンドを薄く包み、`BACKENDS` に加える。
+
 送信先が Claude Code で入力欄が vim モードのときは入力欄に何も入らないことがある。入力欄をクリックして `i` を押すか、`BATON_NEWLINE_KEY=ctrl+j` を試してください。
 
 ## 環境変数
