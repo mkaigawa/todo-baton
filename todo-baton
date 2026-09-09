@@ -1,0 +1,1114 @@
+#!/usr/bin/env python3
+"""todo-baton — todo.md の項目を選んで隣のターミナルの入力欄へ渡すピッカー。
+
+todo.md をテキストエディタで書き足すと自動で読み直し、選んだ項目を直前に
+触っていたターミナルの入力欄へ流し込む。複数行の項目は改行のまま入る。
+送信キーは押さないので、実行するかどうかは人が決める。
+
+    todo-baton open        分割ペインを作ってそこで常駐させる
+    todo-baton             このターミナルで起動する
+    todo-baton --list      項目を一覧表示するだけ
+
+どのターミナルへ渡すかはバックエンドが決める。今あるのは cmux と tmux で、
+起動時に環境から選ぶ (BATON_BACKEND / --backend で固定できる)。
+
+cmux の Dock (右サイドバー) が使えるビルドでは ~/.config/cmux/dock.json の
+TODO コントロールから同じピッカーが立ち上がる。
+"""
+
+from __future__ import annotations
+
+import argparse
+import curses
+import json
+import locale
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+import unicodedata
+from dataclasses import dataclass, field
+from pathlib import Path
+
+TODO_NAMES = ("todo.md", "TODO.md", "Todo.md", ".baton/todo.md")
+TEMPLATE = "# TODO\n\n- [ ] \n"
+
+ITEM_RE = re.compile(
+    r"^(?P<indent>[ \t]*)(?:[-*+]|\d+[.)])[ \t]+\[(?P<mark>[^\]]?)\][ \t]*(?P<text>.*)$"
+)
+HEADING_RE = re.compile(r"^[ \t]*(?P<hashes>#{1,6})[ \t]+(?P<text>.*?)[ \t]*$")
+
+POLL_INTERVAL = 1.2  # 秒。送信先ターミナルを追いかける間隔
+TICK_MS = 400  # curses の入力待ちタイムアウト
+
+# ピッカーが起動したかを画面から判定するときの目印
+PICKER_MARK = "入力欄へ送る"
+
+
+def run(command: list[str], env: dict | None = None) -> tuple[int, str, str]:
+    try:
+        proc = subprocess.run(
+            command, capture_output=True, text=True, env=env, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return 1, "", str(exc)
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+# ---------------------------------------------------------------- バックエンド
+
+
+@dataclass
+class Target:
+    """項目を渡す先のターミナル。"""
+
+    id: str = ""
+    title: str = ""
+    pinned: bool = False  # --target で固定されているか
+
+    @property
+    def label(self) -> str:
+        return self.title or self.id[:8]
+
+
+class Backend:
+    """項目を別のターミナルの入力欄まで運ぶ経路。
+
+    ピッカー本体はこのインターフェースだけを知る。ターミナル多重化ソフトごとの
+    癖 (エスケープの解釈、改行の入れかた、ペインの作りかた) はここに閉じ込める。
+    """
+
+    name = ""
+
+    # 複数行を送るときの改行キー。alt+enter は端末によっては ESC + Enter に
+    # ばらけて届き、受け取った側が ESC を Escape キーとして解釈する。
+    # Claude Code の入力欄が vim モードだと、そこで NORMAL モードに落ちて
+    # 以降に送った文字がコマンドとして食われ、入力欄が空のままになる。
+    NEWLINE_KEYS: dict[str, str] = {}
+    newline_key = "alt+enter"
+
+    @classmethod
+    def detect(cls, inside_only: bool = True) -> "Backend | None":
+        """この環境で使えるなら実体を返す。
+
+        inside_only のときは「今まさにその中で動いている」ときだけ名乗る。
+        """
+        return None
+
+    def refresh(self, target: Target) -> None:
+        """送信先を今アクティブなターミナルに追従させる。固定なら何もしない。"""
+
+    def send_text(self, target: Target, lines: list[str]) -> str:
+        """入力欄にテキストを置く。送信キーは押さない。エラー文字列を返す。"""
+        raise NotImplementedError
+
+    def submit(self, target: Target) -> str:
+        """入力欄の内容を送信する。エラー文字列を返す。"""
+        raise NotImplementedError
+
+    def focus(self, target: Target) -> None:
+        """送信先のターミナルへフォーカスを移す。"""
+
+    def base_dir(self) -> Path | None:
+        """todo.md を探す起点の保険。自分の cwd が使えないときだけ使う。"""
+        return None
+
+    def open_pane(self, command: str, direction: str, focus: bool) -> tuple[str, str]:
+        """分割ペインを作り、その中で command を起動する。(送信先, エラー)。"""
+        return "", f"{self.name} はペインを分割できません"
+
+
+# ---------------------------------------------------------------- cmux
+
+
+class CmuxBackend(Backend):
+    """cmux CLI 経由。
+
+    `cmux send` は本文中の \\n \\r \\t をエスケープとして解釈してしまうので、
+    バックスラッシュの直後で切って複数回に分ける必要がある。
+    """
+
+    name = "cmux"
+
+    NEWLINE_KEYS = {"alt+enter": "alt+enter", "ctrl+j": "ctrl+j"}
+
+    def __init__(self, cli: str) -> None:
+        self.cli = cli
+        self.self_surface = os.environ.get("CMUX_SURFACE_ID") or ""
+        self.self_workspace = os.environ.get("CMUX_WORKSPACE_ID") or ""
+
+    @classmethod
+    def detect(cls, inside_only: bool = True) -> "CmuxBackend | None":
+        cli = os.environ.get("CMUX_BUNDLED_CLI_PATH") or "cmux"
+        if inside_only:
+            if not os.environ.get("CMUX_SURFACE_ID"):
+                return None
+        elif not shutil.which(cli):
+            return None
+        return cls(cli)
+
+    # -- CLI
+
+    def cmux(self, *args: str) -> tuple[int, str, str]:
+        return run([self.cli, *args], env=dict(os.environ, CMUX_QUIET="1"))
+
+    def cmux_json(self, *args: str):
+        code, out, _ = self.cmux(*args)
+        if code != 0 or not out.strip():
+            return None
+        try:
+            return json.loads(out)
+        except json.JSONDecodeError:
+            return None
+
+    # -- 送信先
+
+    def refresh(self, target: Target) -> None:
+        if target.pinned:
+            return
+        tree = self.cmux_json("tree", "--json", "--id-format", "both")
+        if not tree:
+            return
+        candidates = self._candidates(tree)
+        if not candidates:
+            return
+        active = (tree.get("active") or {}).get("surface_id")
+        for surface in candidates:
+            if surface["id"] == active:
+                target.id, target.title = surface["id"], surface.get("title") or ""
+                return
+        if any(surface["id"] == target.id for surface in candidates):
+            for surface in candidates:
+                if surface["id"] == target.id:
+                    target.title = surface.get("title") or target.title
+            return
+        target.id = candidates[0]["id"]
+        target.title = candidates[0].get("title") or ""
+
+    def _candidates(self, tree: dict) -> list[dict]:
+        found: list[dict] = []
+        for window in tree.get("windows") or []:
+            for ws in window.get("workspaces") or []:
+                if self.self_workspace and ws.get("id") != self.self_workspace:
+                    continue
+                panes = ws.get("panes") or []
+                # フォーカスされているペインを先に見る
+                panes = sorted(panes, key=lambda p: not p.get("focused"))
+                for pane in panes:
+                    for surface in pane.get("surfaces") or []:
+                        if surface.get("type") != "terminal":
+                            continue
+                        if surface.get("id") == self.self_surface:
+                            continue
+                        if not surface.get("selected_in_pane", surface.get("selected")):
+                            continue
+                        found.append(surface)
+        return found
+
+    # -- 送る
+
+    def send_text(self, target: Target, lines: list[str]) -> str:
+        """改行はそのまま送ると Enter として届いて途中で送信されてしまうので、
+        行の区切りには改行キー (既定は Option+Enter) を送る。
+        """
+        key = self.NEWLINE_KEYS[self.newline_key]
+        for index, line in enumerate(lines):
+            if index:
+                code, _, err = self.cmux("send-key", "--surface", target.id, key)
+                if code != 0:
+                    return err.strip() or "改行を送れませんでした"
+            for chunk in self._split_escapes(line):
+                if not chunk:
+                    continue
+                code, _, err = self.cmux("send", "--surface", target.id, "--", chunk)
+                if code != 0:
+                    return err.strip() or "テキストを送れませんでした"
+        return ""
+
+    @staticmethod
+    def _split_escapes(text: str) -> list[str]:
+        r"""`cmux send` が解釈してしまう \n \r \t を分断する。
+
+        バックスラッシュの直後で切って別々に送れば、cmux はエスケープとして
+        解釈できず、本文のバックスラッシュがそのまま入力欄に入る。
+        """
+        chunks: list[str] = []
+        buffer: list[str] = []
+        for index, char in enumerate(text):
+            buffer.append(char)
+            if char == "\\" and index + 1 < len(text) and text[index + 1] in "nrt":
+                chunks.append("".join(buffer))
+                buffer = []
+        if buffer:
+            chunks.append("".join(buffer))
+        return chunks
+
+    def submit(self, target: Target) -> str:
+        code, _, err = self.cmux("send-key", "--surface", target.id, "enter")
+        return "" if code == 0 else (err.strip() or "送信できませんでした")
+
+    def focus(self, target: Target) -> None:
+        self.cmux("rpc", "surface.focus", json.dumps({"surface_id": target.id}))
+
+    def base_dir(self) -> Path | None:
+        """cmux が把握しているワークスペースの現在ディレクトリ。
+
+        アクティブなターミナルの cwd を追うので値は動く。
+        """
+        data = self.cmux_json("workspace", "list", "--json", "--id-format", "both")
+        if not data:
+            return None
+        for ws in data.get("workspaces") or []:
+            if self.self_workspace and ws.get("id") == self.self_workspace:
+                directory = ws.get("current_directory")
+                if directory:
+                    return Path(directory)
+        return None
+
+    # -- ペインを開く
+
+    def open_pane(self, command: str, direction: str, focus: bool) -> tuple[str, str]:
+        code, out, err = self.cmux(
+            "new-pane", "--direction", direction, "--focus", "false",
+            "--id-format", "uuids",
+        )
+        if code != 0:
+            return "", err.strip() or "ペインを作れませんでした"
+        parts = out.split()
+        if len(parts) < 2 or parts[0] != "OK":
+            return "", f"想定外の応答です: {out.strip()}"
+        surface_id = parts[1]
+
+        # 初期化中のシェルは打ち込んだ文字を取りこぼすことがあるので、
+        # ピッカーが立ち上がったのを確かめるまで打ち直す
+        for attempt in range(4):
+            self._wait_for_prompt(surface_id)
+            if attempt:
+                self.cmux("send-key", "--surface", surface_id, "ctrl+c")
+                time.sleep(0.4)
+            code, _, err = self.cmux("send", "--surface", surface_id, "--", command)
+            if code != 0:
+                return "", err.strip() or "コマンドを送れませんでした"
+            self.cmux("send-key", "--surface", surface_id, "enter")
+            if self._wait_for_picker(surface_id):
+                # タブ名が exec の長いコマンドラインになるので付け替える
+                self.cmux("rename-tab", "--surface", surface_id, "--", "TODO")
+                if focus:
+                    self.focus(Target(id=surface_id))
+                return surface_id, ""
+
+        return surface_id, "ペインは作れましたが、ピッカーが起動しませんでした"
+
+    def _wait_for_prompt(self, surface_id: str, timeout: float = 6.0) -> None:
+        """新しいシェルが何か描くまで待つ。"""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            time.sleep(0.3)
+            code, screen, _ = self.cmux(
+                "capture-pane", "--surface", surface_id, "--lines", "5")
+            if code == 0 and screen.strip():
+                return
+
+    def _wait_for_picker(self, surface_id: str, timeout: float = 5.0) -> bool:
+        """ピッカーのフッターが出ているかで起動を判定する。"""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            time.sleep(0.4)
+            code, screen, _ = self.cmux(
+                "capture-pane", "--surface", surface_id, "--lines", "60")
+            if code != 0:
+                return False
+            if PICKER_MARK in screen:
+                return True
+        return False
+
+
+# ---------------------------------------------------------------- tmux
+
+
+class TmuxBackend(Backend):
+    """tmux 経由。同じウィンドウのペインを送信先にする。
+
+    `send-keys -l --` はバックスラッシュを解釈しないので、cmux のような
+    分割送りは要らない。
+    """
+
+    name = "tmux"
+
+    SPLIT_FLAGS = {"right": ("-h",), "left": ("-h", "-b"),
+                   "down": ("-v",), "up": ("-v", "-b")}
+    NEWLINE_KEYS = {"alt+enter": "M-Enter", "ctrl+j": "C-j"}
+
+    def __init__(self) -> None:
+        self.self_pane = os.environ.get("TMUX_PANE") or ""
+
+    @classmethod
+    def detect(cls, inside_only: bool = True) -> "TmuxBackend | None":
+        if inside_only and not os.environ.get("TMUX"):
+            return None
+        if not shutil.which("tmux"):
+            return None
+        return cls()
+
+    def tmux(self, *args: str) -> tuple[int, str, str]:
+        return run(["tmux", *args])
+
+    # -- 送信先
+
+    def refresh(self, target: Target) -> None:
+        if target.pinned:
+            return
+        code, out, _ = self.tmux(
+            "list-panes", "-F", "#{pane_id}\t#{pane_active}\t#{pane_last}\t#{pane_title}")
+        if code != 0:
+            return
+        candidates = []
+        for line in out.splitlines():
+            parts = line.split("\t")
+            if len(parts) < 4:
+                continue
+            pane_id, active, last, title = parts[0], parts[1], parts[2], parts[3]
+            if pane_id == self.self_pane:
+                continue
+            candidates.append((pane_id, active == "1", last == "1", title))
+        if not candidates:
+            return
+        # アクティブなペイン → 直前に居たペイン → 先頭 の順に選ぶ
+        candidates.sort(key=lambda c: (not c[1], not c[2]))
+        pane_id, _, _, title = candidates[0]
+        if any(c[0] == target.id for c in candidates) and not candidates[0][1]:
+            for candidate in candidates:
+                if candidate[0] == target.id:
+                    target.title = candidate[3] or target.title
+                    return
+        target.id, target.title = pane_id, title
+
+    # -- 送る
+
+    def send_text(self, target: Target, lines: list[str]) -> str:
+        key = self.NEWLINE_KEYS[self.newline_key]
+        for index, line in enumerate(lines):
+            if index:
+                code, _, err = self.tmux("send-keys", "-t", target.id, key)
+                if code != 0:
+                    return err.strip() or "改行を送れませんでした"
+            if not line:
+                continue
+            code, _, err = self.tmux("send-keys", "-t", target.id, "-l", "--", line)
+            if code != 0:
+                return err.strip() or "テキストを送れませんでした"
+        return ""
+
+    def submit(self, target: Target) -> str:
+        code, _, err = self.tmux("send-keys", "-t", target.id, "Enter")
+        return "" if code == 0 else (err.strip() or "送信できませんでした")
+
+    def focus(self, target: Target) -> None:
+        self.tmux("select-pane", "-t", target.id)
+
+    def base_dir(self) -> Path | None:
+        code, out, _ = self.tmux(
+            "display-message", "-p", "-F", "#{pane_current_path}")
+        if code != 0 or not out.strip():
+            return None
+        return Path(out.strip())
+
+    # -- ペインを開く
+
+    def open_pane(self, command: str, direction: str, focus: bool) -> tuple[str, str]:
+        flags = self.SPLIT_FLAGS.get(direction, ("-h",))
+        args = ["split-window", *flags, "-P", "-F", "#{pane_id}"]
+        if not focus:
+            args.append("-d")
+        # tmux はコマンドを直に渡せるので、cmux のような打ち直しは要らない
+        code, out, err = self.tmux(*args, command)
+        if code != 0:
+            return "", err.strip() or "ペインを作れませんでした"
+        pane_id = out.strip()
+        self.tmux("select-pane", "-t", pane_id, "-T", "TODO")
+        return pane_id, ""
+
+
+BACKENDS: tuple[type[Backend], ...] = (CmuxBackend, TmuxBackend)
+
+
+def choose_backend(preferred: str = "") -> Backend | None:
+    """今の環境で使えるバックエンドを選ぶ。
+
+    まず「その中で動いている」ものを探し、見つからなければ CLI があるものを
+    順に試す。preferred が指定されていればその 1 つだけを見る。
+    """
+    classes = [c for c in BACKENDS if not preferred or preferred == c.name]
+    for inside_only in (True, False):
+        for cls in classes:
+            backend = cls.detect(inside_only)
+            if backend is not None:
+                return backend
+    return None
+
+
+# ---------------------------------------------------------------- todo.md
+
+
+@dataclass
+class Item:
+    lineno: int  # 0-based
+    done: bool
+    lines: list[str]  # 1 行目が項目本体、以降は継続行
+    section: str = ""
+
+    @property
+    def text(self) -> str:
+        """送信・コピーに使う 1 行に畳んだ本文。"""
+        return " ".join(line for line in self.lines if line)
+
+
+@dataclass
+class TodoFile:
+    path: Path
+    lines: list[str] = field(default_factory=list)
+    items: list[Item] = field(default_factory=list)
+    mtime: int = 0  # 最後に読んだ内容の mtime (ナノ秒)
+    error: str = ""
+
+    def load(self) -> None:
+        """読む前と後の mtime が同じときだけ採用する。
+
+        エディタの保存は truncate してから書き直すので、その最中に読むと空や
+        書きかけの内容が入る。読んだあとに mtime を取ると「空の内容 + 保存後の
+        mtime」の組で固まり、次のポーリングでも変化に気づけない。書き換えを
+        またいだら読み直し、それでも収まらなければ今の内容を残して次に回す。
+        """
+        self.error = ""
+        for attempt in range(3):
+            try:
+                before = self.path.stat().st_mtime_ns
+                raw = self.path.read_text(encoding="utf-8")
+                after = self.path.stat().st_mtime_ns
+            except FileNotFoundError:
+                # 保存の一瞬だけ消えるエディタがあるので、あった物なら待つ
+                if attempt < 2 and (self.items or self.mtime):
+                    time.sleep(0.05)
+                    continue
+                self.lines, self.items, self.mtime = [], [], 0
+                self.error = "ファイルがありません"
+                return
+            except OSError as exc:
+                self.lines, self.items, self.mtime = [], [], 0
+                self.error = str(exc)
+                return
+            # 空なら truncate した直後かもしれないので、一度だけ待ち直す
+            settled = raw or attempt == 2 or not (self.items or self.mtime)
+            if before == after and settled:
+                self.mtime = after
+                self.lines = raw.splitlines()
+                self.items = parse_items(self.lines)
+                return
+            time.sleep(0.05)
+        self.mtime = 0  # 書き込みが続いている。次のポーリングで読み直す
+
+    def changed_on_disk(self) -> bool:
+        try:
+            return self.path.stat().st_mtime_ns != self.mtime
+        except OSError:
+            return bool(self.lines) or bool(self.items)
+
+    def toggle(self, item: Item) -> str:
+        """チェックボックスだけを書き換える。他の行はそのまま残す。"""
+        try:
+            raw = self.path.read_text(encoding="utf-8")
+        except OSError as exc:
+            return f"読み込めません: {exc}"
+        lines = raw.splitlines()
+        if item.lineno >= len(lines):
+            return "行がずれています。r で読み直してください"
+        line = lines[item.lineno]
+        match = ITEM_RE.match(line)
+        if not match:
+            return "行がずれています。r で読み直してください"
+        head, tail = line[: match.start("mark")], line[match.end("mark") :]
+        lines[item.lineno] = head + (" " if item.done else "x") + tail
+        newline = "\n"
+        try:
+            self.path.write_text(
+                newline.join(lines) + (newline if raw.endswith(("\n", "\r")) else ""),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            return f"書き込めません: {exc}"
+        self.load()
+        return ""
+
+
+def parse_items(lines: list[str]) -> list[Item]:
+    """チェックボックス行を項目に、その後の行を継続行として拾う。
+
+    継続行の終わりは「空行 / 見出し / 次のチェックボックス行」。インデントは
+    してもしなくてもよい。
+    """
+    items: list[Item] = []
+    section = ""
+    current: Item | None = None
+    for lineno, line in enumerate(lines):
+        match = ITEM_RE.match(line)
+        if match:
+            current = Item(
+                lineno=lineno,
+                done=match.group("mark").strip().lower() == "x",
+                lines=[match.group("text").strip()],
+                section=section,
+            )
+            items.append(current)
+            continue
+        if HEADING_RE.match(line):
+            section = HEADING_RE.match(line).group("text")
+            current = None
+            continue
+        if not line.strip():
+            current = None
+            continue
+        if current is not None:
+            current.lines.append(line.strip())
+    return [item for item in items if item.text]
+
+
+def base_dirs(backend: Backend | None) -> list[Path]:
+    """todo.md を探す起点。自分の cwd を最優先する。"""
+    dirs: list[Path] = []
+    try:
+        cwd = Path.cwd()
+    except OSError:
+        cwd = Path.home()
+    if cwd != Path.home():
+        dirs.append(cwd)
+    fallback = backend.base_dir() if backend is not None else None
+    if fallback is not None and fallback not in dirs:
+        dirs.append(fallback)
+    if not dirs:
+        dirs.append(Path.home())
+    return dirs
+
+
+def find_todo(bases: list[Path]) -> Path:
+    """各起点から親方向に todo.md を探す。ホームディレクトリで打ち切る。"""
+    for base in bases:
+        for directory in [base, *base.parents]:
+            for name in TODO_NAMES:
+                candidate = directory / name
+                if candidate.is_file():
+                    return candidate
+            if directory == Path.home():
+                break
+    fallback = Path.home() / "todo.md"
+    if fallback.is_file():
+        return fallback
+    return bases[0] / "todo.md"
+
+
+# ---------------------------------------------------------------- 項目の整形
+
+
+def sanitize(line: str) -> str:
+    """制御文字は入力欄で誤動作するので落とす。"""
+    stripped = "".join(char for char in line if unicodedata.category(char) != "Cc")
+    return " ".join(stripped.split())
+
+
+def payload_lines(item: Item) -> list[str]:
+    lines = [sanitize(line) for line in item.lines]
+    return [line for line in lines if line] or [""]
+
+
+def copy_to_clipboard(text: str) -> str:
+    try:
+        subprocess.run(["pbcopy"], input=text, text=True, check=True, timeout=5)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"クリップボードに入れられません: {exc}"
+    return ""
+
+# ---------------------------------------------------------------- 表示幅
+
+
+def dwidth(text: str) -> int:
+    width = 0
+    for char in text:
+        if unicodedata.combining(char):
+            continue
+        width += 2 if unicodedata.east_asian_width(char) in "WF" else 1
+    return width
+
+
+def dtrunc(text: str, limit: int) -> str:
+    if limit <= 0:
+        return ""
+    if dwidth(text) <= limit:
+        return text
+    out, width = [], 0
+    for char in text:
+        char_width = 0 if unicodedata.combining(char) else (
+            2 if unicodedata.east_asian_width(char) in "WF" else 1
+        )
+        if width + char_width > limit - 1:
+            break
+        out.append(char)
+        width += char_width
+    return "".join(out) + "…"
+
+
+def dwrap(text: str, limit: int) -> list[str]:
+    """表示幅で折り返す。空白があればそこで切る。"""
+    if not text:
+        return [""]
+    lines, current, width = [], [], 0
+    for char in text:
+        char_width = 0 if unicodedata.combining(char) else (
+            2 if unicodedata.east_asian_width(char) in "WF" else 1
+        )
+        if width + char_width > limit and current:
+            chunk = "".join(current)
+            cut = chunk.rfind(" ")
+            if cut > limit // 2:  # 単語の途中で切らずに済むときだけ空白で折る
+                lines.append(chunk[:cut])
+                current = list(chunk[cut + 1:])
+                width = dwidth("".join(current))
+            else:
+                lines.append(chunk)
+                current, width = [], 0
+        current.append(char)
+        width += char_width
+    if current:
+        lines.append("".join(current))
+    return lines
+
+
+def shorten_path(path: Path) -> str:
+    try:
+        return "~/" + str(path.relative_to(Path.home()))
+    except ValueError:
+        return str(path)
+
+
+# ---------------------------------------------------------------- TUI
+
+HELP_LINES = [
+    "↑↓/jk 選択   ⏎ 入力欄へ送る   s 送信まで   y コピー",
+    "x 完了切替   e エディタ   f 完了を隠す   r 再読込   q 終了",
+]
+
+
+class Picker:
+    def __init__(self, todo: TodoFile, backend: Backend, target: Target,
+                 focus_after_send: bool):
+        self.todo = todo
+        self.backend = backend
+        self.target = target
+        self.focus_after_send = focus_after_send
+        self.cursor = 0
+        self.scroll = 0
+        self.hide_done = False
+        self.status = ""
+        self.status_until = 0.0
+        self.last_poll = 0.0
+
+    # -- 状態
+    def visible(self) -> list[Item]:
+        if self.hide_done:
+            return [item for item in self.todo.items if not item.done]
+        return list(self.todo.items)
+
+    def selected(self) -> Item | None:
+        items = self.visible()
+        if not items:
+            return None
+        self.cursor = max(0, min(self.cursor, len(items) - 1))
+        return items[self.cursor]
+
+    def say(self, message: str, seconds: float = 4.0) -> None:
+        self.status = message
+        self.status_until = time.monotonic() + seconds
+
+    # -- 描画
+    def draw(self, stdscr) -> None:
+        stdscr.erase()
+        height, width = stdscr.getmaxyx()
+        usable = max(10, width - 1)
+        inner = max(10, width - 2)
+        items = self.visible()
+        done = sum(1 for item in self.todo.items if item.done)
+
+        header_left = f" TODO  {shorten_path(self.todo.path)}"
+        header_right = f"{done}/{len(self.todo.items)} "
+        pad = max(1, usable - dwidth(header_left) - dwidth(header_right))
+        self._put(stdscr, 0, 0, header_left + " " * pad + header_right,
+                  curses.A_BOLD | self._color(1))
+        self._put(stdscr, 1, 0, "─" * usable, self._color(4))
+
+        footer_rows = len(HELP_LINES) + 2
+        body_top, body_bottom = 2, max(3, height - footer_rows)
+        body_height = max(1, body_bottom - body_top)
+
+        if self.todo.error:
+            self._put(stdscr, body_top, 1,
+                      dtrunc(f"{self.todo.error}  (c で作成)", inner), self._color(3))
+        elif not items:
+            note = "未完了の項目がありません (f で完了分も表示)" if self.hide_done \
+                else "todo.md に `- [ ] やりたいこと` を書き足してください"
+            self._put(stdscr, body_top, 1, dtrunc(note, inner), self._color(4))
+        else:
+            self._draw_body(stdscr, items, body_top, body_bottom, body_height, usable)
+
+        self._put(stdscr, body_bottom, 0, "─" * usable, self._color(4))
+        if self.target.id:
+            label = self.target.label
+            suffix = " (固定)" if self.target.pinned else ""
+            line = f" → {label}{suffix}"
+            attr = self._color(2)
+        else:
+            line = " → 送信先のターミナルが見つかりません"
+            attr = self._color(3)
+        self._put(stdscr, body_bottom + 1, 0, dtrunc(line, usable), attr)
+
+        if self.status and time.monotonic() < self.status_until:
+            self._put(stdscr, body_bottom + 2, 0, dtrunc(f" {self.status}", usable),
+                      self._color(2) | curses.A_BOLD)
+        else:
+            for offset, text in enumerate(HELP_LINES):
+                row = body_bottom + 2 + offset
+                if row < height:
+                    self._put(stdscr, row, 1, dtrunc(text, inner), self._color(4))
+        stdscr.noutrefresh()
+        curses.doupdate()
+
+    def _draw_body(self, stdscr, items, body_top, body_bottom, body_height,
+                   usable) -> None:
+        rows = self._layout(items, usable)
+        owned = [i for i, row in enumerate(rows) if row[1] == self.cursor]
+        head = next((i for i, row in enumerate(rows)
+                     if row[0] == "head" and row[1] == self.cursor), 0)
+        last = owned[-1] if owned else head
+
+        if head < self.scroll:
+            self.scroll = head
+        elif last >= self.scroll + body_height:
+            self.scroll = min(head, last - body_height + 1)
+        self.scroll = max(0, min(self.scroll, max(0, len(rows) - body_height)))
+
+        for offset in range(body_height):
+            index = self.scroll + offset
+            if index >= len(rows):
+                break
+            kind, item_index, text = rows[index]
+            row = body_top + offset
+            if row >= body_bottom:
+                break
+            selected = item_index == self.cursor
+            item = items[item_index] if item_index >= 0 else None
+            if kind == "section":
+                self._put(stdscr, row, 3, text, self._color(4))
+            elif kind == "head":
+                self._draw_line(stdscr, row, usable, text,
+                                prefix=f"{'▸ ' if selected else '  '}"
+                                       f"{'✓ ' if item.done else '○ '}"
+                                       f"{item_index + 1:>2} ",
+                                selected=selected, done=item.done, cont=False)
+            else:
+                self._draw_line(stdscr, row, usable, text, prefix="     │ ",
+                                selected=selected, done=item.done, cont=True)
+
+    def _layout(self, items, usable) -> list[tuple[str, int, str]]:
+        """1 項目を複数行に展開した描画行のリストを作る。"""
+        rows: list[tuple[str, int, str]] = []
+        section = None
+        limit = max(4, usable - 7)
+        for index, item in enumerate(items):
+            if item.section and item.section != section:
+                section = item.section
+                rows.append(("section", -1, dtrunc(item.section, usable - 3)))
+            elif not item.section:
+                section = None
+            first = True
+            for line in item.lines:
+                for chunk in dwrap(line, limit):
+                    rows.append(("head" if first else "cont", index, chunk))
+                    first = False
+        return rows
+
+    def _draw_line(self, stdscr, row: int, usable: int, text: str, prefix: str,
+                   selected: bool, done: bool, cont: bool) -> None:
+        if selected:
+            attr = curses.A_REVERSE | (curses.A_DIM if done else curses.A_BOLD)
+        elif done or cont:
+            attr = curses.A_DIM
+        else:
+            attr = curses.A_NORMAL
+        line = prefix + text
+        self._put(stdscr, row, 0, line, attr)
+        if selected:
+            self._put(stdscr, row, dwidth(line),
+                      " " * max(0, usable - dwidth(line)), curses.A_REVERSE)
+
+    @staticmethod
+    def _put(stdscr, row: int, col: int, text: str, attr=curses.A_NORMAL) -> None:
+        height, width = stdscr.getmaxyx()
+        if row >= height or col >= width:
+            return
+        try:
+            stdscr.addstr(row, col, dtrunc(text, width - col - 1), attr)
+        except curses.error:
+            pass
+
+    @staticmethod
+    def _color(pair: int):
+        return curses.color_pair(pair) if curses.has_colors() else curses.A_NORMAL
+
+    # -- 操作
+    def act_send(self, submit: bool) -> None:
+        item = self.selected()
+        if item is None:
+            self.say("送る項目がありません")
+            return
+        self.backend.refresh(self.target)
+        if not self.target.id:
+            self.say("送信先のターミナルが見つかりません")
+            return
+        lines = payload_lines(item)
+        if not any(lines):
+            self.say("本文が空なので送れません")
+            return
+        error = self.backend.send_text(self.target, lines)
+        if error:
+            self.say(error, 6.0)
+            return
+        if self.focus_after_send:
+            self.backend.focus(self.target)
+        label = dtrunc(lines[0], 40)
+        if len(lines) > 1:
+            label += f" (全 {len(lines)} 行)"
+        if submit:
+            error = self.backend.submit(self.target)
+            if error:
+                self.say(error, 6.0)
+                return
+            self.say(f"送信しました: {label}")
+        else:
+            self.say(f"入力欄へ入れました: {label}")
+
+    def act_copy(self) -> None:
+        item = self.selected()
+        if item is None:
+            self.say("コピーする項目がありません")
+            return
+        lines = payload_lines(item)
+        if not any(lines):
+            self.say("本文が空なのでコピーしません")
+            return
+        error = copy_to_clipboard("\n".join(lines))
+        self.say(error or f"コピーしました: {dtrunc(item.text, 40)}")
+
+    def act_toggle(self) -> None:
+        item = self.selected()
+        if item is None:
+            return
+        error = self.todo.toggle(item)
+        self.say(error or ("完了にしました" if not item.done else "未完了に戻しました"))
+
+    def act_create(self) -> None:
+        if self.todo.path.exists():
+            return
+        try:
+            self.todo.path.parent.mkdir(parents=True, exist_ok=True)
+            self.todo.path.write_text(TEMPLATE, encoding="utf-8")
+        except OSError as exc:
+            self.say(f"作成できません: {exc}", 6.0)
+            return
+        self.todo.load()
+        self.say(f"{shorten_path(self.todo.path)} を作りました")
+
+    def act_edit(self, stdscr) -> None:
+        editor = os.environ.get("VISUAL") or os.environ.get("EDITOR")
+        command = [*editor.split(), str(self.todo.path)] if editor else \
+            ["open", "-t", str(self.todo.path)]
+        if editor:
+            curses.def_prog_mode()
+            curses.endwin()
+            try:
+                subprocess.run(command)
+            except OSError as exc:
+                self.say(f"エディタを開けません: {exc}", 6.0)
+            curses.reset_prog_mode()
+            stdscr.clearok(True)
+        else:
+            try:
+                subprocess.run(command, capture_output=True, timeout=10)
+            except (OSError, subprocess.SubprocessError) as exc:
+                self.say(f"エディタを開けません: {exc}", 6.0)
+        self.todo.load()
+
+    # -- 本体
+    def run(self, stdscr) -> None:
+        curses.curs_set(0)
+        stdscr.timeout(TICK_MS)
+        if curses.has_colors():
+            curses.use_default_colors()
+            for pair, color in ((1, curses.COLOR_CYAN), (2, curses.COLOR_GREEN),
+                                (3, curses.COLOR_YELLOW), (4, -1)):
+                try:
+                    curses.init_pair(pair, color, -1)
+                except curses.error:
+                    pass
+            try:
+                curses.init_pair(4, curses.COLOR_WHITE, -1)
+            except curses.error:
+                pass
+
+        self.backend.refresh(self.target)
+        while True:
+            now = time.monotonic()
+            if now - self.last_poll >= POLL_INTERVAL:
+                self.last_poll = now
+                self.backend.refresh(self.target)
+                if self.todo.changed_on_disk():
+                    self.todo.load()
+            self.draw(stdscr)
+
+            try:
+                key = stdscr.get_wch()
+            except curses.error:
+                continue
+            except KeyboardInterrupt:
+                return
+
+            if key == curses.KEY_RESIZE:
+                continue
+            if key in ("q", "Q", "\x1b"):
+                return
+            if key in (curses.KEY_UP, "k"):
+                self.cursor = max(0, self.cursor - 1)
+            elif key in (curses.KEY_DOWN, "j"):
+                self.cursor = min(max(0, len(self.visible()) - 1), self.cursor + 1)
+            elif key == curses.KEY_HOME or key == "g":
+                self.cursor = 0
+            elif key == curses.KEY_END or key == "G":
+                self.cursor = max(0, len(self.visible()) - 1)
+            elif key in ("\n", "\r", curses.KEY_ENTER):
+                self.act_send(submit=False)
+            elif key == "s":
+                self.act_send(submit=True)
+            elif key in ("y", "Y"):
+                self.act_copy()
+            elif key in ("x", " "):
+                self.act_toggle()
+            elif key in ("r", "R"):
+                self.todo.load()
+                self.backend.refresh(self.target)
+                self.say("読み直しました")
+            elif key in ("f", "F"):
+                self.hide_done = not self.hide_done
+                self.cursor = 0
+                self.say("完了を隠します" if self.hide_done else "完了も表示します")
+            elif key in ("e", "E"):
+                self.act_edit(stdscr)
+            elif key in ("c", "C"):
+                self.act_create()
+            elif isinstance(key, str) and key.isdigit() and key != "0":
+                index = int(key) - 1
+                if index < len(self.visible()):
+                    self.cursor = index
+
+
+# ---------------------------------------------------------------- entry
+
+
+def resolve_todo(path_arg: str | None, backend: Backend | None) -> Path:
+    if path_arg:
+        return Path(path_arg).expanduser()
+    env_file = os.environ.get("BATON_FILE")
+    if env_file:
+        return Path(env_file).expanduser()
+    return find_todo(base_dirs(backend))
+
+
+def do_open(backend: Backend, todo_path: Path, direction: str, focus: bool) -> int:
+    script = Path(__file__).resolve()
+    command = f"exec {shlex.quote(str(script))} --file {shlex.quote(str(todo_path))}"
+    if backend.newline_key != Backend.newline_key:
+        command += f" --newline-key {backend.newline_key}"
+    target_id, error = backend.open_pane(command, direction, focus)
+    if error:
+        print(error, file=sys.stderr)
+        if target_id:
+            print(f"そのペインで直接 {script} を実行してください。", file=sys.stderr)
+        return 1
+    print(f"{target_id} でピッカーを開きました ({todo_path})")
+    return 0
+
+
+def main() -> int:
+    locale.setlocale(locale.LC_ALL, "")
+    parser = argparse.ArgumentParser(
+        prog="todo-baton",
+        description="todo.md の項目を選んで隣のターミナルの入力欄へ渡す",
+    )
+    parser.add_argument(
+        "command", nargs="?", choices=["open"],
+        help="open: 分割ペインを作り、その中でピッカーを起動する",
+    )
+    parser.add_argument("--file", help="todo.md のパス (既定: 親方向に探索)")
+    parser.add_argument("--backend", default="",
+                        choices=[cls.name for cls in BACKENDS],
+                        help="送信先を扱うバックエンド (既定: 環境から判定)")
+    parser.add_argument("--direction", default="right",
+                        choices=["left", "right", "up", "down"],
+                        help="open のときの分割方向 (既定: right)")
+    parser.add_argument("--focus", action="store_true",
+                        help="open のときに新しいペインへフォーカスを移す")
+    parser.add_argument("--target", help="送信先のターミナルを固定する")
+    parser.add_argument("--list", action="store_true", help="項目を一覧表示して終了")
+    parser.add_argument("--no-focus", action="store_true",
+                        help="送信後に送信先へフォーカスを移さない")
+    parser.add_argument("--newline-key", default="",
+                        choices=["alt+enter", "ctrl+j"],
+                        help="複数行を送るときの改行キー (既定: alt+enter)。"
+                             "送信先が Claude Code で入力欄が空になるなら ctrl+j")
+    args = parser.parse_args()
+
+    backend = choose_backend(args.backend or os.environ.get("BATON_BACKEND", ""))
+    newline_key = args.newline_key or os.environ.get("BATON_NEWLINE_KEY", "")
+    if backend is not None and newline_key in backend.NEWLINE_KEYS:
+        backend.newline_key = newline_key
+
+    path = resolve_todo(args.file, backend)
+    todo = TodoFile(path=path)
+    todo.load()
+
+    if args.list:
+        if todo.error:
+            print(f"{path}: {todo.error}", file=sys.stderr)
+            return 1
+        for index, item in enumerate(todo.items, 1):
+            print(f"{index:>3} {'x' if item.done else ' '} {item.text}")
+        return 0
+
+    if backend is None:
+        wanted = args.backend or os.environ.get("BATON_BACKEND") or "cmux / tmux"
+        print(f"送信先を扱えるバックエンドが見つかりません ({wanted})", file=sys.stderr)
+        return 1
+
+    if args.command == "open":
+        return do_open(backend, path, args.direction, args.focus)
+
+    pinned = args.target or os.environ.get("BATON_TARGET") or ""
+    target = Target(id=pinned, pinned=bool(pinned))
+    picker = Picker(todo, backend, target, focus_after_send=not args.no_focus)
+    curses.wrapper(picker.run)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
