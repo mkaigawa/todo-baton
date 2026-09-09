@@ -105,10 +105,6 @@ class Backend:
         """入力欄にテキストを置く。送信キーは押さない。エラー文字列を返す。"""
         raise NotImplementedError
 
-    def submit(self, target: Target) -> str:
-        """入力欄の内容を送信する。エラー文字列を返す。"""
-        raise NotImplementedError
-
     def focus(self, target: Target) -> None:
         """送信先のターミナルへフォーカスを移す。"""
 
@@ -245,10 +241,6 @@ class CmuxBackend(Backend):
         if buffer:
             chunks.append("".join(buffer))
         return chunks
-
-    def submit(self, target: Target) -> str:
-        code, _, err = self.cmux("send-key", "--surface", target.id, "enter")
-        return "" if code == 0 else (err.strip() or "送信できませんでした")
 
     def focus(self, target: Target) -> None:
         self.cmux("rpc", "surface.focus", json.dumps({"surface_id": target.id}))
@@ -401,10 +393,6 @@ class TmuxBackend(Backend):
             if code != 0:
                 return err.strip() or "テキストを送れませんでした"
         return ""
-
-    def submit(self, target: Target) -> str:
-        code, _, err = self.tmux("send-keys", "-t", target.id, "Enter")
-        return "" if code == 0 else (err.strip() or "送信できませんでした")
 
     def focus(self, target: Target) -> None:
         self.tmux("select-pane", "-t", target.id)
@@ -711,7 +699,7 @@ def shorten_path(path: Path) -> str:
 # ---------------------------------------------------------------- TUI
 
 HELP_LINES = [
-    "↑↓/jk 選択   ⏎ 入力欄へ送る   s 送信まで   y コピー",
+    "↑↓/jk 選択   ⏎ 入力欄へ送る   y コピー",
     "x 完了切替   e エディタ   f 完了を隠す   r 再読込   q 終了",
 ]
 
@@ -882,7 +870,7 @@ class Picker:
         return curses.color_pair(pair) if curses.has_colors() else curses.A_NORMAL
 
     # -- 操作
-    def act_send(self, submit: bool) -> None:
+    def act_send(self) -> None:
         item = self.selected()
         if item is None:
             self.say("送る項目がありません")
@@ -904,14 +892,7 @@ class Picker:
         label = dtrunc(lines[0], 40)
         if len(lines) > 1:
             label += f" (全 {len(lines)} 行)"
-        if submit:
-            error = self.backend.submit(self.target)
-            if error:
-                self.say(error, 6.0)
-                return
-            self.say(f"送信しました: {label}")
-        else:
-            self.say(f"入力欄へ入れました: {label}")
+        self.say(f"入力欄へ入れました: {label}")
 
     def act_copy(self) -> None:
         item = self.selected()
@@ -1011,9 +992,7 @@ class Picker:
             elif key == curses.KEY_END or key == "G":
                 self.cursor = max(0, len(self.visible()) - 1)
             elif key in ("\n", "\r", curses.KEY_ENTER):
-                self.act_send(submit=False)
-            elif key == "s":
-                self.act_send(submit=True)
+                self.act_send()
             elif key in ("y", "Y"):
                 self.act_copy()
             elif key in ("x", " "):
