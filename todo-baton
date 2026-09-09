@@ -9,9 +9,14 @@ todo.md をテキストエディタで書き足すと自動で読み直し、選
     todo-baton             このターミナルで起動する
     todo-baton --list      項目を一覧表示するだけ
 
-どのターミナルへ渡すかはバックエンドが決める。今あるのは cmux と tmux で、
-起動時に環境から選ぶ (BATON_BACKEND / --backend で固定できる)。バックエンドは
-resolve_target() と paste() の 2 つだけを外に見せる。
+どのターミナルへ渡すかはバックエンドが決める。**使う前提は cmux か tmux の
+中**で、起動時に環境から選ぶ (BATON_BACKEND / --backend で固定できる)。
+バックエンドは resolve_target() と paste() の 2 つだけを外に見せる。
+
+多重化ソフトの外では入力欄へ直接置く手段が無い。--backend clipboard を明示
+すればクリップボードに入れるところまでは動くが、貼るのは人になり、渡す相手が
+居ない普通の todo リストに近づく。そのため自動では選ばず、素の端末では
+cmux / tmux を促して終了する。
 
 cmux の Dock (右サイドバー) が使えるビルドでは ~/.config/cmux/dock.json の
 TODO コントロールから同じピッカーが立ち上がる。
@@ -88,6 +93,13 @@ class Backend:
     """
 
     name = ""
+
+    # 送り先を人に見せるときの言い方。paste() が実際にどこへ置くかに合わせる。
+    destination = "入力欄"
+
+    # --backend / BATON_BACKEND で明示されたときだけ選ばれるか。前提の外に
+    # ある経路 (渡す相手が居ない) を、環境まかせで引かせないための印。
+    opt_in = False
 
     # 複数行を送るときの改行キー。alt+enter は端末によっては ESC + Enter に
     # ばらけて届き、受け取った側が ESC を Escape キーとして解釈する。
@@ -166,11 +178,16 @@ class CmuxBackend(Backend):
     def detect(cls, inside_only: bool = True) -> "CmuxBackend | None":
         cli = os.environ.get("CMUX_BUNDLED_CLI_PATH") or "cmux"
         if inside_only:
-            if not os.environ.get("CMUX_SURFACE_ID"):
-                return None
-        elif not shutil.which(cli):
+            return cls(cli) if os.environ.get("CMUX_SURFACE_ID") else None
+        if not shutil.which(cli):
             return None
-        return cls(cli)
+        # cmux CLI は cmux 内で起動されたプロセス以外を拒否する。判定している
+        # のは環境変数ではなくプロセスの親子関係なので、PATH に cmux がある
+        # かどうかでは分からない。実際に叩いて通るかどうかで決める。
+        # (ここを PATH だけで通すと、素のターミナルでも cmux が選ばれて
+        #  「アクセスが拒否されました」しか返ってこなくなる)
+        backend = cls(cli)
+        return backend if backend.cmux_json("tree", "--json") is not None else None
 
     # -- CLI
 
@@ -365,20 +382,45 @@ class TmuxBackend(Backend):
                    "down": ("-v",), "up": ("-v", "-b")}
     NEWLINE_KEYS = {"alt+enter": "M-Enter", "ctrl+j": "C-j"}
 
-    def __init__(self) -> None:
+    def __init__(self, session: str = "") -> None:
         super().__init__()
         self.self_pane = os.environ.get("TMUX_PANE") or ""
+        # tmux の外から使うときの相手セッション。中に居るなら空 (現在の
+        # セッションがそのまま相手になる)。
+        self.session = session
 
     @classmethod
     def detect(cls, inside_only: bool = True) -> "TmuxBackend | None":
-        if inside_only and not os.environ.get("TMUX"):
-            return None
         if not shutil.which("tmux"):
             return None
-        return cls()
+        if inside_only:
+            return cls() if os.environ.get("TMUX") else None
+        # tmux の外からでも相手にできるが、誰も attach していないセッションに
+        # 送っても人の目には入らない。ペインが見えない場所に生えて、送った
+        # 項目もそこで止まる。attach 済みのセッションだけを相手にする。
+        code, out, _ = cls().tmux(
+            "list-sessions", "-F",
+            "#{session_attached}\t#{session_activity}\t#{session_name}")
+        if code != 0:
+            return None
+        attached = []
+        for line in out.splitlines():
+            parts = line.split("\t")
+            if len(parts) < 3 or parts[0] == "0":
+                continue
+            attached.append((int(parts[1] or 0), parts[2]))
+        if not attached:
+            return None
+        # 直近に触っていたセッションを相手にする
+        attached.sort(reverse=True)
+        return cls(attached[0][1])
 
     def tmux(self, *args: str) -> tuple[int, str, str]:
         return run(["tmux", *args])
+
+    def window_args(self) -> list[str]:
+        """相手セッションの現在のウィンドウを指す -t。中に居るときは空。"""
+        return ["-t", f"{self.session}:"] if self.session else []
 
     # -- 送信先
 
@@ -389,7 +431,8 @@ class TmuxBackend(Backend):
 
     def _follow_active(self) -> None:
         code, out, _ = self.tmux(
-            "list-panes", "-F", "#{pane_id}\t#{pane_active}\t#{pane_last}\t#{pane_title}")
+            "list-panes", *self.window_args(),
+            "-F", "#{pane_id}\t#{pane_active}\t#{pane_last}\t#{pane_title}")
         if code != 0:
             return
         candidates = []
@@ -435,7 +478,7 @@ class TmuxBackend(Backend):
 
     def base_dir(self) -> Path | None:
         code, out, _ = self.tmux(
-            "display-message", "-p", "-F", "#{pane_current_path}")
+            "display-message", "-p", *self.window_args(), "-F", "#{pane_current_path}")
         if code != 0 or not out.strip():
             return None
         return Path(out.strip())
@@ -444,7 +487,8 @@ class TmuxBackend(Backend):
 
     def open_pane(self, command: str, direction: str, focus: bool) -> tuple[str, str]:
         flags = self.SPLIT_FLAGS.get(direction, ("-h",))
-        args = ["split-window", *flags, "-P", "-F", "#{pane_id}"]
+        args = ["split-window", *flags, *self.window_args(),
+                "-P", "-F", "#{pane_id}"]
         if not focus:
             args.append("-d")
         # tmux はコマンドを直に渡せるので、cmux のような打ち直しは要らない
@@ -456,16 +500,59 @@ class TmuxBackend(Backend):
         return pane_id, ""
 
 
-BACKENDS: tuple[type[Backend], ...] = (CmuxBackend, TmuxBackend)
+# ---------------------------------------------------------------- clipboard
+
+
+class ClipboardBackend(Backend):
+    """クリップボード経由。貼るのは人。
+
+    ターミナル多重化ソフトの外では、別のターミナルの入力欄へ文字を入れる
+    汎用の手段が無い。TIOCSTI は自分の制御端末にしか撃てず、Accessibility の
+    キー送出 (osascript の System Events) は最前面のアプリにしか届かないので
+    どのペインかを指定できない。ここでは pbcopy まででやめて、貼るのは人に
+    任せる。
+
+    渡す相手が居ないぶんこの道具の値打ちは薄い (普通の todo リストに近づく)
+    ので、opt_in にして環境まかせでは選ばれないようにしてある。
+    """
+
+    name = "clipboard"
+    destination = "クリップボード"
+    opt_in = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.target = Target(id=self.name, title="クリップボード (⌘V で貼る)")
+
+    @classmethod
+    def detect(cls, inside_only: bool = True) -> "ClipboardBackend | None":
+        # opt_in なので明示されたときしか呼ばれない。「その中で動いている」
+        # という概念も無いので inside_only は見ない。
+        return cls() if shutil.which("pbcopy") else None
+
+    def resolve_target(self) -> Target | None:
+        return self.target
+
+    def paste(self, text: str) -> str:
+        return copy_to_clipboard(text)
+
+    def open_pane(self, command: str, direction: str, focus: bool) -> tuple[str, str]:
+        return "", ("クリップボード経由ではペインを分割できません。"
+                    "このターミナルで todo-baton を実行してください。")
+
+
+BACKENDS: tuple[type[Backend], ...] = (CmuxBackend, TmuxBackend, ClipboardBackend)
 
 
 def choose_backend(preferred: str = "") -> Backend | None:
     """今の環境で使えるバックエンドを選ぶ。
 
-    まず「その中で動いている」ものを探し、見つからなければ CLI があるものを
-    順に試す。preferred が指定されていればその 1 つだけを見る。
+    まず「その中で動いている」ものを探し、見つからなければ実際に叩いて通る
+    ものを順に試す。どれも駄目なら None で、呼ぶ側が cmux / tmux を促す。
+    opt_in のものは preferred で名指ししたときだけ候補に入る。
     """
-    classes = [c for c in BACKENDS if not preferred or preferred == c.name]
+    classes = [c for c in BACKENDS
+               if preferred == c.name or (not preferred and not c.opt_in)]
     for inside_only in (True, False):
         for cls in classes:
             backend = cls.detect(inside_only)
@@ -735,7 +822,7 @@ def shorten_path(path: Path) -> str:
 # ---------------------------------------------------------------- TUI
 
 HELP_LINES = [
-    "↑↓/jk 選択   ⏎ 入力欄へ送る   y コピー",
+    "↑↓/jk 選択   ⏎ {dest}へ送る   y コピー",
     "x 完了切替   e エディタ   f 完了を隠す   r 再読込   q 終了",
 ]
 
@@ -745,6 +832,7 @@ class Picker:
                  focus_after_send: bool):
         self.todo = todo
         self.backend = backend
+        self.help = [line.format(dest=backend.destination) for line in HELP_LINES]
         self.target: Target | None = None  # 表示用。実体は backend が持つ
         self.focus_after_send = focus_after_send
         self.cursor = 0
@@ -787,7 +875,7 @@ class Picker:
                   curses.A_BOLD | self._color(1))
         self._put(stdscr, 1, 0, "─" * usable, self._color(4))
 
-        footer_rows = len(HELP_LINES) + 2
+        footer_rows = len(self.help) + 2
         body_top, body_bottom = 2, max(3, height - footer_rows)
         body_height = max(1, body_bottom - body_top)
 
@@ -816,7 +904,7 @@ class Picker:
             self._put(stdscr, body_bottom + 2, 0, dtrunc(f" {self.status}", usable),
                       self._color(2) | curses.A_BOLD)
         else:
-            for offset, text in enumerate(HELP_LINES):
+            for offset, text in enumerate(self.help):
                 row = body_bottom + 2 + offset
                 if row < height:
                     self._put(stdscr, row, 1, dtrunc(text, inner), self._color(4))
@@ -928,7 +1016,7 @@ class Picker:
         label = dtrunc(lines[0], 40)
         if len(lines) > 1:
             label += f" (全 {len(lines)} 行)"
-        self.say(f"入力欄へ入れました: {label}")
+        self.say(f"{self.backend.destination}へ入れました: {label}")
 
     def act_copy(self) -> None:
         item = self.selected()
@@ -1155,8 +1243,15 @@ def main() -> int:
         return 0
 
     if backend is None:
-        wanted = args.backend or os.environ.get("BATON_BACKEND") or "cmux / tmux"
-        print(f"送信先を扱えるバックエンドが見つかりません ({wanted})", file=sys.stderr)
+        wanted = args.backend or os.environ.get("BATON_BACKEND", "")
+        if wanted:
+            print(f"送信先を扱えるバックエンドが見つかりません ({wanted})",
+                  file=sys.stderr)
+        else:
+            print("渡す先のターミナルがありません。cmux か tmux の中で使って"
+                  "ください。", file=sys.stderr)
+            print("選んでクリップボードに入れるだけなら --backend clipboard "
+                  "を付けてください。", file=sys.stderr)
         return 1
 
     if args.command == "open":
