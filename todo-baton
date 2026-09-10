@@ -87,9 +87,10 @@ class Backend:
     外部コマンドの形も見ない。ターミナル多重化ソフトごとの癖 (エスケープの
     解釈、改行の入れかた、ペインの作りかた) はここに閉じ込める。
 
-    zellij や wezterm を足すときも、この 2 つと、できるなら任意の 3 つ
-    (focus / base_dir / open_pane) を外部コマンドの薄いラッパーとして書き、
-    BACKENDS に加えるだけで済む。呼ぶ側には分岐を持たせない。
+    zellij や wezterm を足すときも、この 2 つと、できるなら任意のもの
+    (focus / base_dir / open_pane と、画面を覗く capture / 1 回分を送る
+    send_text / send_key) を外部コマンドの薄いラッパーとして書き、BACKENDS
+    に加えるだけで済む。呼ぶ側には分岐を持たせない。
     """
 
     name = ""
@@ -107,6 +108,21 @@ class Backend:
     # 以降に送った文字がコマンドとして食われ、入力欄が空のままになる。
     NEWLINE_KEYS: dict[str, str] = {}
     newline_key = "alt+enter"
+
+    # 送信先の入力欄が vim モードの NORMAL に落ちていると、送った文字は本文
+    # ではなく vim のコマンドとして食われる。日本語だけの行は丸ごと捨てられ
+    # て入力欄が空のまま、英字を含む行は最初の i や a までが消えて途中から
+    # 入る。Claude Code はメッセージを送るたびに NORMAL へ戻るので、
+    # 「一度目は入るのに二度目から入らない」という形で出る。
+    # モード表示は NORMAL のときだけ何も出ない。つまり「表示が無い」は
+    # 「NORMAL」と「vim モードではない」の両方を意味するので、見ただけでは
+    # 決まらない。
+    INSERT_MARK = "-- INSERT --"
+    VISUAL_MARK = "-- VISUAL"  # -- VISUAL -- / -- VISUAL LINE --
+    INSERT_KEY = "i"
+    BACKSPACE = "backspace"
+    PROBE_WAIT = 0.6  # 秒。i を打ってからモード表示が出るまで待つ上限
+    PROBE_STEP = 0.1
 
     def __init__(self) -> None:
         self.target = Target()
@@ -152,6 +168,70 @@ class Backend:
     def open_pane(self, command: str, direction: str, focus: bool) -> tuple[str, str]:
         """分割ペインを作り、その中で command を起動する。(送信先, エラー)。"""
         return "", f"{self.name} はペインを分割できません"
+
+    def capture(self, lines: int = 6) -> str:
+        """送信先の画面末尾。覗けないバックエンドは空文字。"""
+        return ""
+
+    @staticmethod
+    def tail(screen: str, lines: int) -> str:
+        """末尾の空行を捨ててから最後の lines 行を返す。
+
+        入力欄が画面の下端にあるとは限らない。履歴が短いうちは下が空行の
+        ままなので、素直に最後の数行を取るとモード表示ではなく空行を見て
+        「画面が覗けない」と誤解する。
+        """
+        rows = screen.splitlines()
+        while rows and not rows[-1].strip():
+            rows.pop()
+        return "\n".join(rows[-lines:])
+
+    def send_text(self, text: str) -> tuple[int, str]:
+        """送信先に文字列を 1 回送る。(終了コード, エラー)。"""
+        return 1, f"{self.name} は文字を送れません"
+
+    def send_key(self, key: str) -> tuple[int, str]:
+        """送信先にキーを 1 回送る。(終了コード, エラー)。"""
+        return 1, f"{self.name} はキーを送れません"
+
+    def ensure_insert(self) -> str:
+        """本文の直前に i を打って、入力欄を INSERT にする。エラーを返す。
+
+        画面を見てから送るまでの間にモードは動く (相手が Escape を押す、
+        メッセージの送信で NORMAL に戻る) ので、「今どのモードか」を判断して
+        から送ると、その判断が外れたときに本文が vim のコマンドとして食われる。
+        判断せず必ず i を打てば、NORMAL なら INSERT に入り、INSERT なら i が
+        1 文字入るだけで、本文が届く時点では必ず INSERT になっている。
+
+        余った i は消す。消さないのは「打つ前は表示が無く、打った後に INSERT
+        が出た」ときだけで、これは i がコマンドとして食われた (=NORMAL だった)
+        証拠なので入力欄には何も入っていない。
+        """
+        screen = self.capture()
+        if self.VISUAL_MARK in screen:
+            # 人が入れたモードなので道具では戻さない。i は文字選択の起点に
+            # なってしまうので打たない。
+            return "相手の入力欄が VISUAL です。NORMAL に戻してから送ってください"
+        was_insert = self.INSERT_MARK in screen
+        if self.send_text(self.INSERT_KEY)[0] != 0:
+            return ""
+        if was_insert or not self._wait_insert():
+            self.send_key(self.BACKSPACE)
+        return ""
+
+    def _wait_insert(self) -> bool:
+        """モード表示が INSERT になるのを待つ。出なければ False。
+
+        画面を覗けないバックエンドと vim モードでない相手はどちらも表示が
+        出ないので、待つだけ待って False になる。
+        """
+        deadline = time.monotonic() + self.PROBE_WAIT
+        while True:
+            time.sleep(self.PROBE_STEP)
+            if self.INSERT_MARK in self.capture():
+                return True
+            if time.monotonic() >= deadline:
+                return False
 
 
 # ---------------------------------------------------------------- cmux
@@ -253,20 +333,37 @@ class CmuxBackend(Backend):
 
     # -- 送る
 
+    def capture(self, lines: int = 6) -> str:
+        # 末尾の空行を捨てるぶん、欲しい行数より多めに取る
+        code, out, _ = self.cmux(
+            "capture-pane", "--surface", self.target.id,
+            "--lines", str(max(lines * 4, 40)))
+        return self.tail(out, lines) if code == 0 else ""
+
+    def send_text(self, text: str) -> tuple[int, str]:
+        code, _, err = self.cmux("send", "--surface", self.target.id, "--", text)
+        return code, err.strip()
+
+    def send_key(self, key: str) -> tuple[int, str]:
+        code, _, err = self.cmux("send-key", "--surface", self.target.id, key)
+        return code, err.strip()
+
     def paste(self, text: str) -> str:
+        error = self.ensure_insert()
+        if error:
+            return error
         key = self.NEWLINE_KEYS[self.newline_key]
         for index, line in enumerate(text.split("\n")):
             if index:
-                code, _, err = self.cmux("send-key", "--surface", self.target.id, key)
+                code, err = self.send_key(key)
                 if code != 0:
-                    return err.strip() or "改行を送れませんでした"
+                    return err or "改行を送れませんでした"
             for chunk in self._split_escapes(line):
                 if not chunk:
                     continue
-                code, _, err = self.cmux(
-                    "send", "--surface", self.target.id, "--", chunk)
+                code, err = self.send_text(chunk)
                 if code != 0:
-                    return err.strip() or "テキストを送れませんでした"
+                    return err or "テキストを送れませんでした"
         return ""
 
     @staticmethod
@@ -381,6 +478,7 @@ class TmuxBackend(Backend):
     SPLIT_FLAGS = {"right": ("-h",), "left": ("-h", "-b"),
                    "down": ("-v",), "up": ("-v", "-b")}
     NEWLINE_KEYS = {"alt+enter": "M-Enter", "ctrl+j": "C-j"}
+    BACKSPACE = "BSpace"
 
     def __init__(self, session: str = "") -> None:
         super().__init__()
@@ -458,19 +556,34 @@ class TmuxBackend(Backend):
 
     # -- 送る
 
+    def capture(self, lines: int = 6) -> str:
+        code, out, _ = self.tmux("capture-pane", "-p", "-t", self.target.id)
+        return self.tail(out, lines) if code == 0 else ""
+
+    def send_text(self, text: str) -> tuple[int, str]:
+        code, _, err = self.tmux(
+            "send-keys", "-t", self.target.id, "-l", "--", text)
+        return code, err.strip()
+
+    def send_key(self, key: str) -> tuple[int, str]:
+        code, _, err = self.tmux("send-keys", "-t", self.target.id, key)
+        return code, err.strip()
+
     def paste(self, text: str) -> str:
+        error = self.ensure_insert()
+        if error:
+            return error
         key = self.NEWLINE_KEYS[self.newline_key]
         for index, line in enumerate(text.split("\n")):
             if index:
-                code, _, err = self.tmux("send-keys", "-t", self.target.id, key)
+                code, err = self.send_key(key)
                 if code != 0:
-                    return err.strip() or "改行を送れませんでした"
+                    return err or "改行を送れませんでした"
             if not line:
                 continue
-            code, _, err = self.tmux(
-                "send-keys", "-t", self.target.id, "-l", "--", line)
+            code, err = self.send_text(line)
             if code != 0:
-                return err.strip() or "テキストを送れませんでした"
+                return err or "テキストを送れませんでした"
         return ""
 
     def focus(self) -> None:
